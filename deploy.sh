@@ -1,0 +1,132 @@
+#!/bin/bash
+
+# minikube tunnel to create local LB
+echo "sudo required for minikube tunnel:"
+sudo bash -c "echo 'starting minikube tunnel'"
+minikube tunnel &> /dev/null &
+tunnel_pid=$!
+
+# playing with self-signed certs
+kubectl delete secret telemongo-tls
+kubectl create secret tls telemongo-tls --cert=./ca.pem --key=./telemongo.key
+kubectl create secret generic telemongo-root-ca --from-file=ca.pem=./ca.pem
+
+# install local chart with teleport-cluster dependency
+helm install telemongo ./charts/telemongo
+
+echo -n "waiting for external ip..."
+while [ -z "$EXTERNAL_IP" ]
+do
+    EXTERNAL_IP=$(kubectl get service telemongo -o jsonpath='{ .status.loadBalancer.ingress[0].ip }')
+    sleep 1
+    echo -n "."
+done    
+
+echo "got $EXTERNAL_IP"
+
+echo -n "waiting for teleport ping..."
+while [ -z "$PING" ]
+do
+    PING=$(curl -s --insecure https://${EXTERNAL_IP?}:443/webapi/ping)
+    sleep 1
+    echo -n "."
+done
+echo "pong"
+
+# adding teleport cluster ip to /etc/hosts for name resolution
+echo "updating /etc/hosts..."
+sudo -E bash -c "echo \"${EXTERNAL_IP?} telemongo.default.svc.cluster.local\" >> /etc/hosts"
+
+# installing mongodb helm chart with intial config
+echo "installing mongodb"
+helm install mongodb bitnami/mongodb -f mongo.yaml 
+
+# creating teleport user
+echo -e "creating teleport user..."
+PROXY_POD=$(kubectl get po -l app=telemongo -o jsonpath='{.items[0].metadata.name}')
+PROXY_ADDR="$(kubectl get service telemongo -o jsonpath="{.spec.clusterIP}"):443"
+OUTPUT=$(kubectl exec $PROXY_POD -- tctl users add --roles=access --db-users=\* --db-names=\* user)
+INVITE_URL=$(echo "$OUTPUT" | grep https | tr -d '\n')
+
+echo "navigate to $INVITE_URL to complete user creation..."
+chromium $INVITE_URL
+
+# creating a new token for database service
+echo -e "adding db token to teleport..."
+OUTPUT=$(kubectl exec -i $PROXY_POD -- tctl tokens add --type=db)
+INVITE_TOKEN=$(echo "$OUTPUT" | grep invite | awk '{print $4}' | tr -d '\n') 
+
+echo -e "waiting for mongodb pod..."
+while [ -z "$MONGODB_POD" ]
+do
+    MONGODB_POD=$(kubectl get po -l app.kubernetes.io/component=mongodb -o jsonpath='{.items[0].metadata.name}')
+    sleep 1
+    echo -n "."
+done
+echo -e "waiting for mongodb ip..."
+while [ -z "$MONGODB_ADDR" ]
+do
+    MONGODB_ADDR="$(kubectl get service mongodb -o jsonpath="{.spec.clusterIP}")"
+    sleep 1
+    echo -n "."
+done
+
+echo -e "waiting for mongodb to become ready..."
+
+while [ "$MONGODB_READY" != "true" ]
+do
+    MONGODB_READY=$( kubectl get po -l app.kubernetes.io/component=mongodb -o jsonpath='{.items[0].status.containerStatuses[0].ready}')
+    sleep 1
+    echo -n "."
+done
+
+
+# creating certs for mongodb mutual tls auth
+kubectl exec $PROXY_POD -- tctl auth sign --format=mongodb --host $MONGODB_ADDR --out=mongo --ttl=2190h --overwrite
+kubectl cp $PROXY_POD:mongo.cas mongo.cas
+kubectl cp $PROXY_POD:mongo.crt mongo.crt
+
+# copying certs to conveniently writable bitnami directory
+kubectl cp mongo.cas mongodb-0:/bitnami/mongodb/mongo.cas
+kubectl cp mongo.crt mongodb-0:/bitnami/mongodb/mongo.crt
+
+# upgrade to apply cert configuration (thanks to persistent volume)
+helm upgrade mongodb bitnami/mongodb -f mongo.yaml -f mongotls.yaml #\
+#     --set tls.enabled=true \
+#     --set tls.caCert="$(cat cert-00 | base64)" \
+#     --set tls.caKey="$(cat cert-01 | base64)"
+
+echo -e "waiting for mongodb ip..."
+while [ -z "$MONGODB_ADDR" ]
+do
+    MONGODB_ADDR="$(kubectl get service mongodb -o jsonpath="{.spec.clusterIP}")"
+    sleep 1
+    echo -n "."
+done
+sudo -E bash -c "echo \"${MONGODB_ADDR} mongo.cluster.local\" >> /etc/hosts"
+
+# installing database service with teleport-kube-agent
+echo "creating database service from kube-agent..."
+helm install teleport-kube-agent teleport/teleport-kube-agent \
+  --set roles="db" \
+  --set proxyAddr="telemongo.default.svc.cluster.local:443" \
+  --set authToken=${INVITE_TOKEN?} \
+  --set "databases[0].name"="mongodb" \
+  --set "databases[0].uri"=mongodb://mongo.cluster.local:27017 \
+  --set "databases[0].protocol"="mongodb" \
+  --set insecureSkipProxyTLSVerify=true \
+  --set log.level=DEBUG
+
+
+DATABASE_POD=$(kubectl get po -l app=teleport-kube-agent -o jsonpath='{.items[0].metadata.name}')
+
+read -p "Teardown? " -n 1 -r
+echo    # (optional) move to a new line
+if [[ $REPLY =~ ^[Yy]$ ]]
+then
+    helm delete telemongo
+    helm delete teleport-kube-agent
+    kill -9 $tunnel_pid
+    sudo -E bash -c "sed -i '/mongo/d' /etc/hosts"
+fi
+

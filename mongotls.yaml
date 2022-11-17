@@ -1,0 +1,7 @@
+extraFlags:
+  - "--tlsMode=requireTLS"
+  - "--tlsCertificateKeyFile=/bitnami/mongodb/mongo.crt"
+  - "--tlsCAFile=/bitnami/mongodb/mongo.cas"
+extraEnvVars:
+  - name: MONGODB_ADVERTISED_HOSTNAME
+    value: mongo.cluster.local

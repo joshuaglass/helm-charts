@@ -1,0 +1,19 @@
+[req]
+distinguished_name = req_distinguished_name
+req_extensions = req_ext
+prompt = no
+
+[req_distinguished_name]
+C   = US
+ST  = TX
+L   = PO
+O   = DU
+OU  = SS
+CN  = *.cluster.local
+
+[req_ext]
+subjectAltName = @alt_names
+
+[alt_names]
+DNS.1 =*.cluster.local
+

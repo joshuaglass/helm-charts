@@ -1,0 +1,4 @@
+extraFlags:
+  - "--tlsMode=requireTLS"
+  - "--tlsCertificateKeyFile=/bitnami/mongodb/mongo.crt"
+  - "--tlsCAFile=/bitnami/mongodb/mongo.cas"
